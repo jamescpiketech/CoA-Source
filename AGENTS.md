@@ -168,3 +168,13 @@ Optional: one short paragraph in plain English for the reader (at most 300 chara
   `python changelog.py new --area bots --type fixed --audience players --title "..."`.
 - Full guide with examples: https://github.com/Corfirean/coa-server-build/blob/main/changelog/GUIDE.md
 <!-- changelog:end -->
+
+## Server build and release handoff
+
+The cross-repository build/release workflow lives in `Corfirean/coa-server-build`:
+`AGENTS.md` and `docs/server-release.md`. Read that runbook when asked to integrate or release a server.
+Freeze upstream, custom-race release, both bot systems, Content Scaling and Manager revisions before building.
+Use an isolated integration branch and pass exact SHAs to GitHub Actions. A requested build for later release must
+use `publish_candidate=false`; preserve the successful build run, source lock, snapshot, artifacts and actual test
+coverage for the next agent. Publishing a GitHub release or changing stable requires the owner's separate command
+for that candidate. Do not advance the production branch while an automatic release could publish unapproved work.
