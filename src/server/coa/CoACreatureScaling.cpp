@@ -16,6 +16,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 
 namespace
@@ -24,6 +25,8 @@ namespace
     std::shared_ptr<CreatureScaling::Settings const> Configured = std::make_shared<CreatureScaling::Settings>();
     std::shared_ptr<CreatureScaling::Settings const> Override;
     std::atomic<bool> Enabled = false;
+    std::atomic<CreatureScaling::CombatAuthority> Authority = nullptr;
+    std::atomic<CreatureScaling::CombatAuthority> HealthBudgetAuthority = nullptr;
     std::unordered_set<uint32> FlexHealthEntries;
 
     std::shared_ptr<CreatureScaling::Settings const> Active()
@@ -63,6 +66,14 @@ namespace
             map->IsRegularDifficulty(), map->IsRaid(), map->IsDungeon());
     }
 
+    bool OwnedElsewhere(CreatureScaling::Context context, Creature const* creature)
+    {
+        if (!CreatureScaling::CanBeHandedOver(context))
+            return false;
+        CreatureScaling::CombatAuthority const authority = Authority;
+        return authority && authority(creature);
+    }
+
     float DamageMultiplier(Unit const* target, Unit const* attacker)
     {
         if (!Enabled || !target || !attacker || !target->GetCharmerOrOwnerPlayerOrPlayerItself())
@@ -73,7 +84,8 @@ namespace
         CreatureScaling::Context const context = ContextOf(creature);
         if (context == CreatureScaling::Context::None)
             return 1.0f;
-        return CreatureScaling::Multiplier(Active()->damage, context, creature->GetMapId());
+        return CreatureScaling::Multiplier(Active()->damage, context, creature->GetMapId(), creature->GetLevel(),
+            OwnedElsewhere(context, creature));
     }
 
     template <typename T>
@@ -85,23 +97,45 @@ namespace
             damage = T(CreatureScaling::Scaled(uint32(damage), multiplier));
     }
 
+    CreatureScaling::Formula ReadFormula(std::string const& key, CreatureScaling::Formula const& fallback)
+    {
+        std::string const text = sConfigMgr->GetOption<std::string>(key, fallback.Text());
+        if (std::optional<CreatureScaling::Formula> formula = CreatureScaling::Formula::Parse(text))
+            return *formula;
+        LOG_ERROR("server.loading", "{} = \"{}\" is neither a number nor a formula of level; using {}", key, text,
+            fallback.Text());
+        return fallback;
+    }
+
     CreatureScaling::Multipliers ReadMultipliers(std::string const& kind, CreatureScaling::Multipliers const& defaults)
     {
         CreatureScaling::Multipliers result;
-        result.world = sConfigMgr->GetOption<float>("CoA.CreatureScaling.World." + kind, defaults.world);
-        result.dungeon = sConfigMgr->GetOption<float>("CoA.CreatureScaling.Dungeon." + kind, defaults.dungeon);
-        result.raid = sConfigMgr->GetOption<float>("CoA.CreatureScaling.Raid." + kind, defaults.raid);
+        result.world = ReadFormula("CoA.CreatureScaling.World." + kind, defaults.world);
+        result.dungeon = ReadFormula("CoA.CreatureScaling.Dungeon." + kind, defaults.dungeon);
+        result.raid = ReadFormula("CoA.CreatureScaling.Raid." + kind, defaults.raid);
         result.maps = CreatureScaling::ParseMapMultipliers(sConfigMgr->GetOption<std::string>(
             "CoA.CreatureScaling.Map" + kind, CreatureScaling::FormatMapMultipliers(defaults.maps), false));
         return result;
     }
 }
 
+void CreatureScaling::SetCombatAuthority(CombatAuthority authority)
+{
+    Authority = authority;
+}
+
+void CreatureScaling::SetHealthBudgetAuthority(CombatAuthority authority)
+{
+    HealthBudgetAuthority = authority;
+}
+
 float CreatureScaling::HealthMultiplier(Creature const* creature)
 {
     if (!Enabled || !IsEligible(creature) || HasFlexHealth(creature))
         return 1.0f;
-    return CreatureScaling::Multiplier(Active()->health, ::ContextOf(creature), creature->GetMapId());
+    Context const context = ::ContextOf(creature);
+    return CreatureScaling::Multiplier(Active()->health, context, creature->GetMapId(), creature->GetLevel(),
+        OwnedElsewhere(context, creature));
 }
 
 CreatureScaling::TestOverride::TestOverride()
@@ -153,9 +187,9 @@ public:
         LOG_INFO("server.loading",
             ">> CoA creature scaling {}: health {}/{}/{}, damage {}/{}/{} (world/dungeon/raid), "
             "{} map health overrides, {} flex health entries kept",
-            settings->enabled ? "enabled" : "disabled", settings->health.world, settings->health.dungeon,
-            settings->health.raid, settings->damage.world, settings->damage.dungeon, settings->damage.raid,
-            settings->health.maps.size(), FlexHealthEntries.size());
+            settings->enabled ? "enabled" : "disabled", settings->health.world.Text(), settings->health.dungeon.Text(),
+            settings->health.raid.Text(), settings->damage.world.Text(), settings->damage.dungeon.Text(),
+            settings->damage.raid.Text(), settings->health.maps.size(), FlexHealthEntries.size());
     }
 };
 
@@ -166,7 +200,9 @@ public:
 
     void OnCreatureSelectLevel(CreatureTemplate const*, Creature* creature) override
     {
-        float const multiplier = CreatureScaling::HealthMultiplier(creature);
+        CreatureScaling::CombatAuthority const budgetAuthority = HealthBudgetAuthority;
+        float const multiplier = CreatureScaling::HookMultiplier(CreatureScaling::HealthMultiplier(creature),
+            budgetAuthority && budgetAuthority(creature));
         if (multiplier == 1.0f)
             return;
         uint32 const health = CreatureScaling::Scaled(creature->GetCreateHealth(), multiplier);
